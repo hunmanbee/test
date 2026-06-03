@@ -1,0 +1,574 @@
+classdef DownlinkSPEnv < rl.env.MATLABEnvironment
+    % DownlinkSPEnv - 下行调度预留的强化学习环境
+    % 适用于 MATLAB 2025a
+
+    properties
+        Handle;
+
+        % 当前决策的 STA 索引
+        CurrentSTAIdx = 1;
+
+        % 环境参数
+        MaxSlotsPerMS = 20;    % 每 ms 最大时隙
+        MaxPreConNum = 24;     % 全局最大预留时隙
+        DecisionInterval = 200; % 决策间隔（时隙）= 10ms
+
+        % 状态历史
+        StateHistory = [];     % 状态历史
+        ActionHistory = [];    % 动作历史
+        RewardHistory = [];    % 奖励历史
+
+        % 奖励参数
+        RewardWeights = struct(...
+            'throughput', 1.0, ...
+            'delay', -0.5, ...
+            'fairness', 0.3, ...
+            'waste', -0.2, ...
+            'priority', 0.5);
+        Agents = {};                    % cell array，存放每个 STA 的独立 Agent
+        SharedBuffer;         % 所有 Agent 共享的经验池
+    end
+
+    properties (Access = private)
+        % 内部计时器
+        LastDecisionTime = 0;
+        EpisodeStepCount = 0;
+        MaxEpisodeSteps = 50;  % 每个 episode 最大步数
+        LastAction = [];
+    end
+
+    methods
+       
+        function this = DownlinkSPEnv(handles, sta_num)
+            fprintf('=== DownlinkSPEnv 构造函数开始执行 ===\n');
+            
+            obsInfo = DownlinkSPEnv.createObservationInfo_static();
+            actInfo = DownlinkSPEnv.createActionInfo_static();
+            
+            % 调用父类构造函数
+            this = this@rl.env.MATLABEnvironment(obsInfo, actInfo);
+            
+            this.Handle = handles;
+            this.CurrentSTAIdx = 1;
+        
+            % ====================== 多智能体初始化 ======================
+            % 确保和实际STA数量一致
+            this.Agents = cell(1, sta_num);
+            this.SharedBuffer = rlReplayMemory(obsInfo, actInfo, 100000);
+            
+            fprintf('正在为 %d 个 STA 创建独立 Agent...\n', sta_num);
+            
+            for i = 1:sta_num
+                this.Agents{i} = createD3QNAgent(this);
+                fprintf('  Agent %d 创建完成\n', i);
+            end
+            
+            fprintf('=== 多智能体 D3QN 初始化完成！共 %d 个 Agent ===\n', length(this.Agents));
+            fprintf('=== DownlinkSPEnv 创建成功！===\n\n');
+        end
+
+        function obsInfo = createObservationInfo(this)
+            % 创建观察空间信息
+            % 状态向量：[tid_norm, buffer_norm, rate_norm, delay_norm,
+            %            channel_norm, load_norm, alloc_norm, congestion]
+
+            obsInfo = rlNumericSpec([8, 1]);
+            obsInfo.Name = 'Downlink State Observation';
+            obsInfo.Description = [...
+                'tid_norm: Traffic ID (0-3) normalized; ', ...
+                'buffer_norm: Buffer level normalized; ', ...
+                'rate_norm: Recent rate normalized; ', ...
+                'delay_norm: Average delay normalized; ', ...
+                'channel_norm: Channel index normalized; ', ...
+                'load_norm: Global load normalized; ', ...
+                'alloc_norm: Current allocation normalized; ', ...
+                'congestion: Congestion flag (0 or 1)'];
+            obsInfo.LowerLimit = 0;
+            obsInfo.UpperLimit = 1;
+        end
+
+        function actInfo = createActionInfo(this)
+            % 创建动作空间信息
+            % 动作：多离散动作 [Slot_Num, Interval, Slot_Index]
+
+            % 方法1: 使用有限动作集合（适用于动作组合较少的情况）
+            % 创建所有可能的动作组合
+            actions = {};
+            for slot_num = 0:4
+                for interval = 1:3
+                    for slot_index = 0:19
+                        % 可选：添加一些过滤条件
+                        actions{end+1} = [slot_num, interval, slot_index];
+                    end
+                end
+            end
+
+            actInfo = rlFiniteSetSpec(actions);
+            actInfo.Name = 'Downlink Reservation Action';
+            actInfo.Description = 'Multi-discrete: [Slot_Num, Interval, Slot_Index]';
+
+            % 方法2: 如果 MATLAB 2025a 支持 MultiDiscrete 动作空间
+            % 请检查您的 MATLAB 版本是否支持以下语法
+            % actInfo = rlMultiDiscreteActionSpec([5, 3, 20]);
+            % actInfo.Name = 'Downlink Reservation Action';
+        end
+
+       function [nextObservation, reward, isDone, loggedSignals] = step(this, action)
+            if iscell(action)
+                action = action{1};
+            end
+            
+            % 动作安全检查
+            if length(action) < 3
+                action = [0, 1, 0];
+            end
+            
+            slot_num   = round(action(1));
+            interval   = round(action(2));
+            slot_index = round(action(3));
+            
+            % 动作验证
+            if ~this.validateAction(slot_num, interval, slot_index)
+                reward = -10;
+                nextObservation = this.getCurrentState();
+                isDone = false;
+                loggedSignals = struct('Valid', false);
+                return;
+            end
+            
+            sta_idx = this.CurrentSTAIdx;
+            if sta_idx < 1 || sta_idx > numel(this.Handle.ap.stas_info)
+                reward = -10;
+                nextObservation = this.getCurrentState();
+                isDone = true;
+                loggedSignals = struct('Error', 'Invalid STA');
+                return;
+            end
+            
+            % 应用决策
+            s = this.Handle.ap.stas_info(sta_idx);
+            s.dl_resv_info.Slot_Num   = slot_num;
+            s.dl_resv_info.Interval   = interval;
+            s.dl_resv_info.Slot_Index = slot_index;
+            s.dl_resv_info.Time_Index = 1;
+            s.dl_resv_info.Cycles_Num = 10;
+            s.control_flags_Down      = 3;   % 已由RL决策
+            
+            this.Handle.ap.stas_info(sta_idx) = s;
+            
+            % 计算奖励
+            reward = this.calculateReward(s, slot_num);
+            
+            % 获取下一个状态
+            nextObservation = this.getCurrentState();
+            
+            % 是否结束
+            this.EpisodeStepCount = this.EpisodeStepCount + 1;
+            isDone = (this.EpisodeStepCount >= this.MaxEpisodeSteps) || (s.status == 0);
+            
+            loggedSignals = struct('STA_Idx', sta_idx, 'Slot_Num', slot_num, ...
+                                   'Interval', interval, 'Slot_Index', slot_index, ...
+                                   'Reward', reward, 'Valid', true);
+            this.LastAction = action;
+        end
+        function initialObservation = reset(this)
+            % 重置环境
+
+            % 重置计数器
+            this.EpisodeStepCount = 0;
+            this.LastDecisionTime = 0;
+
+            % 清空历史
+            this.StateHistory = [];
+            this.ActionHistory = [];
+            this.RewardHistory = [];
+
+            % 选择一个新的 STA 进行决策
+            valid_stas = find([this.Handle.ap.stas_info.status] == 1);
+            if isempty(valid_stas)
+                this.CurrentSTAIdx = 1;
+                initialObservation = zeros(8, 1);
+            else
+                this.CurrentSTAIdx = valid_stas(randi(length(valid_stas)));
+                initialObservation = this.getCurrentState();
+            end
+        end
+
+        function observation = getCurrentState(this)
+            if this.CurrentSTAIdx > numel(this.Handle.ap.stas_info) || this.CurrentSTAIdx < 1
+                observation = zeros(10, 1);
+                return;
+            end
+            
+            s = this.Handle.ap.stas_info(this.CurrentSTAIdx);
+            
+            % 计算历史分配成功率
+            actual_used = s.actual_used_slots_this_cycle;
+            allocated = s.dl_resv_info.Slot_Num;
+            success_rate = 0;
+            if allocated > 0
+                success_rate = min(actual_used / allocated, 1.0);
+            end
+        
+            % 全局剩余可用时隙
+            global_remaining = max(0, this.MaxPreConNum - this.getGlobalLoad());
+        
+            observation = [
+                min(s.tid / 7, 1);                                     
+                min(sum([s.dl_tx_info.pkt_bytes]) / 1e6, 1);            
+                min(s.recent_rate_kbps / 1000, 1);                      
+                min(this.getAverageDelay(s) / 100, 1);                  
+                (s.dl_channel - 1) / 3;                                
+                min(this.getGlobalLoad() / this.MaxPreConNum, 1);       
+                s.dl_resv_info.Slot_Num / 6;                            
+                this.getCongestionFlag(s.dl_channel);                   
+                success_rate;                                          
+                min(global_remaining / this.MaxPreConNum, 1)            
+            ];
+        end
+
+        function isValid = validateAction(this, slot_num, interval, slot_index)
+            % 验证动作有效性
+
+            isValid = true;
+
+            % 检查时隙数
+            if slot_num < 0 || slot_num > 4
+                isValid = false;
+                return;
+            end
+
+            % 检查间隔
+            if interval < 1 || interval > 3
+                isValid = false;
+                return;
+            end
+
+            % 检查时隙索引
+            if slot_index < 0 || slot_index > 19
+                isValid = false;
+                return;
+            end
+
+            % 检查时隙冲突（如果分配了时隙）
+            if slot_num > 0
+                % 检查是否与其他预留冲突
+                if this.checkSlotConflict(slot_num, slot_index)
+                    isValid = false;
+                end
+            end
+        end
+
+       
+        function reward = calculateReward(this, s, allocated_slots)
+    avg_delay   = this.getAverageDelay(s);
+    global_load = this.getGlobalLoad() / this.MaxPreConNum;
+    
+    % 1. 基础分配奖励（保持高激励）
+    if allocated_slots == 0
+        base = -8.0;
+    else
+        base = allocated_slots * 17.0 + 17.0;
+    end
+    
+    % 2. 全局负载奖励（保持高正向）
+    if global_load < 0.45
+        load_reward = (global_load - 0.40) * -100;
+    elseif global_load < 0.75
+        load_reward = (global_load - 0.45) * 190;
+    elseif global_load <= 0.90
+        load_reward = 55.0 + (global_load - 0.75) * 110;
+    else
+        load_reward = 68.0 - (global_load - 0.90) * 80;
+    end
+    
+    % 3. 单 STA 时延奖励
+    if avg_delay <= 15
+        delay_reward = 12.0;
+    elseif avg_delay <= 40
+        delay_reward = 12.0 - 0.45 * (avg_delay - 15);
+    else
+        delay_reward = -18.0 - 0.65 * (avg_delay - 40);
+    end
+    
+    % 4. Worst-case 时延惩罚
+    max_delay = this.getMaxDelay();
+    if max_delay > 18
+        worst_penalty = -6.5 * (max_delay - 18);
+    else
+        worst_penalty = 0;
+    end
+    
+    % 5. 【本次最强反轮流饥饿】公平性惩罚
+    delays = arrayfun(@(i) this.getAverageDelay(this.Handle.ap.stas_info(i)), ...
+                      1:numel(this.Handle.ap.stas_info));
+    delays = delays([this.Handle.ap.stas_info.status] == 1);
+    if length(delays) > 1
+        hungry_count = sum(delays > 25);           % 阈值降低到25ms
+        delay_var    = var(delays);
+        fairness_penalty = -6.0 * hungry_count - 2.5 * delay_var;  % 大幅加强
+    else
+        fairness_penalty = 0;
+    end
+    
+    % 6. 多样性奖励
+    diversity = 0;
+    current_act = [allocated_slots, s.dl_resv_info.Interval, s.dl_resv_info.Slot_Index];
+    if ~isempty(this.LastAction)
+        if ~isequal(round(current_act), round(this.LastAction))
+            diversity = 1.2;
+        else
+            diversity = -0.5;
+        end
+    end
+    
+    reward = base + load_reward + delay_reward + worst_penalty + fairness_penalty + diversity;
+    reward = max(min(reward, 130), -150);
+end
+        
+        function avg_delay = getAverageDelay(~, sta_info)
+            % 计算平均时延
+                        delays = [sta_info.dl_tx_info.tot_tx_delay] ./ ...
+                            max(1, [sta_info.dl_tx_info.tot_tx_bagnum]);
+                        avg_delay = mean(delays(delays > 0));
+            if isempty(avg_delay)
+                 avg_delay = 0;
+            end
+        end
+        
+
+       function load = getGlobalLoad(this)
+            % 【最合理版本】直接统计所有在线 STA 的已分配 Slot_Num 总和
+            % 这能给 RL 提供清晰、强烈的全局负载信号，避免时间同步问题
+            if isempty(this.Handle.ap.stas_info)
+                load = 0; return;
+            end
+            
+            effective_slots = 0;
+            for i = 1:numel(this.Handle.ap.stas_info)
+                s = this.Handle.ap.stas_info(i);
+                if s.status == 1 && s.dl_resv_info.Slot_Num > 0
+                    effective_slots = effective_slots + s.dl_resv_info.Slot_Num;
+                end
+            end
+            
+            load = effective_slots;
+            % 调试打印（每10ms打印一次）
+            if mod(this.Handle.slot_idx, 200) == 0
+                fprintf('DEBUG GlobalLoad [t=%4d]: %2d slots (%.3f) | Active STA = %d\n', ...
+                    this.Handle.slot_idx, load, load/this.MaxPreConNum, ...
+                    sum([this.Handle.ap.stas_info.status] == 1));
+            end
+        end
+        function congestion = getCongestionFlag(this, channel)
+            % 获取拥塞标志
+            if channel <= numel(this.Handle.ap.dl_channel_info)
+                congestion = double(numel(this.Handle.ap.dl_channel_info{channel}) > 3);
+            else
+                congestion = 0;
+            end
+        end
+
+        function hasConflict = checkSlotConflict(this, slot_num, slot_index)
+            % 检查时隙冲突
+            hasConflict = false;
+
+            % 检查请求的时隙范围
+            requested_slots = slot_index + (0:slot_num-1);
+
+            % 检查当前信道其他用户的预留
+            channel = this.Handle.ap.stas_info(this.CurrentSTAIdx).dl_channel;
+
+            for i = 1:numel(this.Handle.ap.stas_info)
+                if i == this.CurrentSTAIdx
+                    continue;
+                end
+
+                other_s = this.Handle.ap.stas_info(i);
+                if other_s.status == 1 && other_s.dl_channel == channel
+                    other_slots = other_s.dl_resv_info.Slot_Index + ...
+                        (0:other_s.dl_resv_info.Slot_Num-1);
+
+                    % 检查是否有重叠
+                    if any(ismember(requested_slots, other_slots))
+                        hasConflict = true;
+                        return;
+                    end
+                end
+            end
+        end
+
+        function fairness = calculateFairness(this)
+            % 计算公平性指数（Jain's fairness index）
+
+            valid_stas = find([this.Handle.ap.stas_info.status] == 1);
+            if isempty(valid_stas)
+                fairness = 0;
+                return;
+            end
+
+            % 获取每个STA的吞吐量
+            throughputs = zeros(1, length(valid_stas));
+            for i = 1:length(valid_stas)
+                idx = valid_stas(i);
+                throughputs(i) = this.Handle.ap.stas_info(idx).recent_rate_kbps;
+            end
+
+            % 计算 Jain's fairness index
+            if sum(throughputs) == 0
+                fairness = 0;
+            else
+                fairness = (sum(throughputs)^2) / (length(throughputs) * sum(throughputs.^2));
+            end
+        end
+
+        function waste = calculateSlotWaste(this, sta_info, allocated_slots)
+            % 计算时隙浪费率
+
+            if allocated_slots == 0
+                waste = 0;
+                return;
+            end
+
+            % 获取实际使用的时隙
+            actual_used = sta_info.actual_used_slots_this_cycle;
+
+            % 计算浪费率
+            if allocated_slots > 0
+                waste = max(0, allocated_slots - actual_used) / allocated_slots;
+            else
+                waste = 0;
+            end
+        end
+
+        function recordHistory(this, action, reward, nextState)
+            % 记录历史数据
+
+            % 记录状态
+            currentState = this.getCurrentState();
+            this.StateHistory = [this.StateHistory; currentState'];
+
+            % 记录动作
+            if iscell(action)
+                this.ActionHistory = [this.ActionHistory; action{1}'];
+            else
+                this.ActionHistory = [this.ActionHistory; action'];
+            end
+
+            % 记录奖励
+            this.RewardHistory = [this.RewardHistory; reward];
+        end
+    
+   
+        function applyBaselineAction(this, method)
+            % 根据不同 baseline 方法为当前 STA 分配预留
+            sta_idx = this.CurrentSTAIdx;
+            if sta_idx < 1 || sta_idx > numel(this.Handle.ap.stas_info)
+                return;
+            end
+            
+            s = this.Handle.ap.stas_info(sta_idx);
+            
+            switch lower(method)
+                case 'fixed'
+                    % Fixed: 固定预留 2 个时隙，每 2ms 一次，从第 0 个时隙开始
+                    s.dl_resv_info.Slot_Num   = 6;
+                    s.dl_resv_info.Interval   = 1;
+                    s.dl_resv_info.Slot_Index = 0;
+                    
+                case 'roundrobin'
+                    % Round-Robin: 轮流给不同数量（这里简单实现为交替 1~3 个时隙）
+                    persistent rr_counter;
+                    if isempty(rr_counter), rr_counter = 0; end
+                    rr_counter = mod(rr_counter + 1, 3);
+                    s.dl_resv_info.Slot_Num   = 1 + rr_counter;   % 1,2,3 循环
+                    s.dl_resv_info.Interval   = 1;
+                    s.dl_resv_info.Slot_Index = mod(sta_idx*3, 16); % 不同 STA 错开
+                    
+                case 'greedy'
+                    % Greedy: 给时延最高或缓存最多的 STA 更多时隙
+                    avg_delay = this.getAverageDelay(s);
+                    buffer_level = sum([s.dl_tx_info.pkt_bytes]) / 1e5; % 粗略归一化
+                    
+                    if avg_delay > 40 || buffer_level > 5
+                        s.dl_resv_info.Slot_Num = 4;   % 高需求给最多
+                    elseif avg_delay > 20
+                        s.dl_resv_info.Slot_Num = 3;
+                    else
+                        s.dl_resv_info.Slot_Num = 1;
+                    end
+                    s.dl_resv_info.Interval   = 1;
+                    s.dl_resv_info.Slot_Index = 0;
+                    
+                otherwise
+                    s.dl_resv_info.Slot_Num = 0;
+            end
+            
+            s.dl_resv_info.Time_Index = 1;
+            s.dl_resv_info.Cycles_Num = 10;
+            s.control_flags_Down = 3;   % 标记为已分配
+            
+            this.Handle.ap.stas_info(sta_idx) = s;
+        end
+        function max_delay = getMaxDelay(this)
+            max_delay = 0;
+            for i = 1:numel(this.Handle.ap.stas_info)
+                if this.Handle.ap.stas_info(i).status == 1
+                    d = this.getAverageDelay(this.Handle.ap.stas_info(i));
+                    if d > max_delay
+                        max_delay = d;
+                    end
+                end
+            end
+        end
+    end
+    
+    methods (Static)
+        function obsInfo = createObservationInfo_static()
+             obsInfo = rlNumericSpec([10, 1]);
+                obsInfo.Name = 'Downlink State Observation';
+                obsInfo.Description = [...
+                    'tid_norm: Traffic ID (0-3) normalized; ', ...
+                    'buffer_norm: Buffer level normalized; ', ...
+                    'rate_norm: Recent rate normalized; ', ...
+                    'delay_norm: Average delay normalized; ', ...
+                    'channel_norm: Channel index normalized; ', ...
+                    'load_norm: Global load normalized; ', ...
+                    'alloc_norm: Current allocation normalized; ', ...
+                    'congestion: Congestion flag (0 or 1)'];
+                obsInfo.LowerLimit = 0;
+                obsInfo.UpperLimit = 1;
+        end
+        function actInfo = createActionInfo_static()
+            actions = {};
+            slot_num_options   = [0, 1, 2, 3, 4, 5, 6, 7, 8];           % 5种
+            interval_options   = [1, 2];                    % 2种
+            slot_index_options = [0, 5, 10, 15];            % 4种合理起始位置
+    
+            for sn = slot_num_options
+                for iv = interval_options
+                    for si = slot_index_options
+                        if sn == 0 && iv > 1
+                            continue;  % Slot_Num=0 时不需大Interval
+                        end
+                        if sn >= 3 && si > 10
+                            continue;  % 大分配避免太靠后起始
+                        end
+                        actions{end+1} = [sn, iv, si];
+                    end
+                end
+            end
+    
+            actInfo = rlFiniteSetSpec(actions);
+            actInfo.Name = 'Downlink Reservation Action';
+            actInfo.Description = '[Slot_Num(0-4), Interval(1-2), Slot_Index(0/5/10/15)]';
+            
+            fprintf('动作空间优化完成，大小 = %d\n', length(actions));
+        end
+    end
+end
+
+
+
+
+

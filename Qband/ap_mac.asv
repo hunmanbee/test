@@ -1,0 +1,182 @@
+classdef ap_mac < handle
+    properties (Access = public)
+        mac_address     %mac地址  
+        slot_idx = 5      % zhao error test 后续需要修改%当前时隙号
+        dl_slot_states  %下行信道beacon周期内的每个时隙的状态
+        ul_slot_states  %上行信道beacon周期内的每个时隙的状态
+        stas_info       %相关联的sta的信息
+        sta_num         %关联的sta的数目
+%         tx_queue        %发送缓存队列   %zhao
+%         发送缓存队列放在stas_info中，避免用户上下线导致缓存队列数目异常
+        control_queue   %控制帧发送缓存队列
+        rx_queue        %接收重排序队列
+        dl_result
+        ul_c_result
+        ul_d_result
+        dl_result1       %下行调度结果 下下个1ms结果
+        dl_result2       %下行调度结果 下1ms结果
+        ul_result1       %上行调度结果 下下个1ms结果
+        ul_result2       %上行调度结果 下个1ms结果
+        channel_resvnum_dl  %下行信道已预留用户数
+        channel_resvnum_ul  %上行信道已预留用户数
+        channel_dl_idx = 0;
+        channel_ul_idx = 0;
+        ul_channel = [1,2,3,4]; %上行信道号
+        dl_channel = [5,6,7,8]; %下行信道号
+        polling_result
+        polling_idx ;
+        dl_channel_info ;
+        ul_channel_info ;
+        actual_used_slots_this_cycle ;%预留时隙实际使用率
+    end 
+    methods
+        function obj = ap_mac()
+            obj.polling_idx = zeros(1,numel(obj.ul_channel));
+            obj.dl_channel_info = cell(1,numel(obj.dl_channel));
+            obj.ul_channel_info = cell(1,numel(obj.ul_channel));
+            obj.dl_slot_states = cell(1,numel(obj.dl_channel));
+            obj.polling_result = cell(1,4);
+            obj.control_queue = myQueue();
+            
+            for i = 1 : numel(obj.dl_channel)
+                obj.control_queue(i) = myQueue();
+                obj.dl_slot_states{i} = ones(1,200);
+                obj.dl_slot_states{i}(:) = 265;          %265为NOT_DEFINED
+                obj.dl_slot_states{i}(1) = 257;          %10ms内的第一个时隙配置为BEACON_TX
+                for idx = 1 : 20 : 200
+                    obj.dl_slot_states{i}(idx + 18) = 259;    %259为CONTROL_TX
+                    obj.dl_slot_states{i}(idx + 19) = 259;
+                end
+            end
+            obj.ul_slot_states = ones(1,200);
+            obj.ul_slot_states(:) = 261;          %261为RX
+%             obj.tx_queue = myQueue();
+            obj.channel_resvnum_dl = 0;
+            obj.channel_resvnum_ul = 0;
+            obj.actual_used_slots_this_cycle = 0;
+%             obj.channelmap = zeros(1,10);  
+            
+            obj.sta_num = 0;
+            
+        end
+        function add_sta(obj, c1, channel_dl_idx,channel_ul_idx)
+            obj.sta_num = obj.sta_num + 1;
+            %根据分配的信道更新AP中储存的每个信道的用户uid
+            obj.stas_info(obj.sta_num).sta_id = obj.get_sta_id(); 
+            obj.dl_channel_info{channel_dl_idx} = [obj.dl_channel_info{channel_dl_idx},obj.stas_info(obj.sta_num).sta_id];
+            obj.ul_channel_info{channel_ul_idx} = [obj.ul_channel_info{channel_ul_idx},obj.stas_info(obj.sta_num).sta_id];
+            %存放该用户的上下行信道索引
+            obj.stas_info(obj.sta_num).dl_channel = channel_dl_idx;
+            obj.stas_info(obj.sta_num).ul_channel = channel_ul_idx;
+            %%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            obj.stas_info(obj.sta_num).mac_addr = c1;
+            obj.stas_info(obj.sta_num).status = 0;
+            %%%%%%%%%%%%%%%%%%%%%%MCS相关%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+            obj.stas_info(obj.sta_num).mcs_update_info = struct('mcs_val',1,'failed_num',0,'count',0,'start_time_tick',0,'restricted_mcs',9,'time_lock',-1);
+            obj.stas_info(obj.sta_num).ul_mcs_info = ones(1,8);  %该数组表示上行数据此时采用的MCS等级，优先级为tid的业务对应数组中tid + 1项
+            %wang:之后考虑对每个tid都设置一个mcs_update_info
+            for i = 1 : 8
+                obj.stas_info(obj.sta_num).mcs_update_info(i) =  struct('mcs_val',3,'failed_num',0,'count',0,'start_time_tick',0,'restricted_mcs',9,'time_lock',-1);
+            end
+            %%%%%%%%%%%%%%%%%%%%%%时隙预留相关信息%%%%%%%%%%%%%%%%%%%%%%%%%
+            obj.stas_info(obj.sta_num).ul_resv_info = struct('Time_Index',0,'Interval',0,'Slot_Index',0,'Slot_Num',0,'Cycles_Num',0);
+            obj.stas_info(obj.sta_num).control_flags = 0;%标识位，1代表发送预留请求帧，2代表已到为该用户预留的Beacon周期。
+            obj.stas_info(obj.sta_num).dl_resv_info = struct('Time_Index',0,'Interval',0,'Slot_Index',0,'Slot_Num',0,'Cycles_Num',0);
+            obj.stas_info(obj.sta_num).control_flags_Down = 0;%下行预留标志位，1代表发送下行预留请求帧，0代表不发送，2代表等待ack,3表示允许发送数据
+            obj.stas_info(obj.sta_num).dl_reserve_tick = -1;%下行预留等待位，若为2仍未收到ack，则重发预留请求。
+            %%%%%%%%%%%%%%%%%%%%%信道预留相关信息%%%%%%%%%%%%%%%%%%%%%%
+            obj.stas_info(obj.sta_num).control_flags_DownChal = 0;%下行预留信道发送信息允许位，0表示无预留，1表示等待，2表示允许发送
+            obj.stas_info(obj.sta_num).control_flags_UpChal = 0;%上行预留信道发送信息允许位，0表示无预留，1表示等待，2表示允许接收
+            %zhao 每个STA的速率暂时采用固定值，后续需要修改
+            obj.stas_info(obj.sta_num).tx_rate = 20000000;  %100Mbps  %wang:暂时改小一个数量级 ,考虑到8个tid的包，这里速率改小一些
+            obj.stas_info(obj.sta_num).tid = 0;
+            obj.stas_info(obj.sta_num).seq = zeros(8, 1);
+            obj.stas_info(obj.sta_num).rx_array = repmat(struct('frame','','time_stamp',0), 8, 2^16);
+            obj.stas_info(obj.sta_num).lsn = zeros(8,1);
+            obj.stas_info(obj.sta_num).fsn = repmat(-1, 1, 8);
+            obj.stas_info(obj.sta_num).msn = repmat(-1, 1, 8);  %最后收到的包序号
+            obj.stas_info(obj.sta_num).ack = {};
+            obj.stas_info(obj.sta_num).maxoffset = zeros(8,1);
+            obj.stas_info(obj.sta_num).dl_send_state = zeros(10,1);  %表示Beacon周期的某一ms是否对该STA发包
+            obj.stas_info(obj.sta_num).getcontrolnum = true;   %表示有下行数据时因时隙不够未分配到上行控制时隙，分配到则为true  
+            obj.stas_info(obj.sta_num).ul_receive_state = zeros(8,1);
+            %%%%%%%%%上行时延统计信息%%%%%%%%%%%%%%%
+            obj.stas_info(obj.sta_num).ul_rx_delay = zeros(8,1);
+            obj.stas_info(obj.sta_num).ul_rx_bagnum = zeros(8,1);
+            %%%%%%%%%%发送队列相关%%%%%%%%%%%%%%%
+            for i = 1 : 8
+                obj.stas_info(obj.sta_num).tx_queue(i) = myQueue();   
+                obj.stas_info(obj.sta_num).retry_queue(i) = myQueue(); 
+                obj.stas_info(obj.sta_num).backup_queue(i) = myQueue(); 
+                obj.stas_info(obj.sta_num).control_queue_ell = myQueue();
+                obj.stas_info(obj.sta_num).dl_tx_info(i).pkt_bytes = 0;
+                obj.stas_info(obj.sta_num).dl_tx_info(i).pkt_num = 0;
+                %%%%%%%%%时延统计信息%%%%%%%%%%%%%%%
+                obj.stas_info(obj.sta_num).dl_tx_info(i).tot_tx_delay = 0;  %总延迟
+                obj.stas_info(obj.sta_num).dl_tx_info(i).tot_tx_bagnum = 0;  %发的包总数量
+            end 
+
+            % 在 add_sta 函数中，初始化新STA时添加
+            obj.stas_info(obj.sta_num).dl_byte_this_ms = 0;     % 本1ms新产生字节数（bit或byte均可，这里用byte）
+            obj.stas_info(obj.sta_num).prev_dl_bytes = 0;     % 上1ms结束时的累计缓冲字节数
+            obj.stas_info(obj.sta_num).dl_byte_history = zeros(1,20);  % 最近20ms的字节历史（环形缓冲）
+            obj.stas_info(obj.sta_num).history_idx = 1;
+            obj.stas_info(obj.sta_num).recent_rate_kbps = 0;
+            obj.stas_info(obj.sta_num).actual_used_slots_this_cycle = 0;  % 本周期实际使用预留时隙数
+            obj.stas_info(obj.sta_num).actual_sent_bytes_this_cycle = 0;  % 本周期实际发送字节数
+            %%%%%%%%上行buffer信息%%%%%%%%%%%%%%%
+            obj.stas_info(obj.sta_num).buffer_len = zeros(1,8); %对每个tid的上行数据维护一个buffer_len.
+            %%%%%%%%%%%%%%%%%%%%%%%
+        end
+        function delete_sta(obj, mac_addr)  %wang:这里还是用mac地址找下标
+            num = obj.sta_num;
+            idx = [];
+            for i = 1 : num
+                if obj.stas_info(i).mac_addr == mac_addr
+                    idx = [idx,i];
+                    obj.sta_num = obj.sta_num - 1;
+                end
+            end
+            obj.stas_info(idx) = [];
+            fprintf('sta num = %d\n',numel(obj.stas_info));
+        end
+        function sta_id = get_sta_id(obj)  %假设此方法只在关联时调用,（只在add_sta中使用）
+            num = obj.sta_num;
+            uid_space = [];
+            sta_id = num;
+            for i = 1 : num - 1
+                uid_space(obj.stas_info(i).sta_id) = 1;
+            end
+            for i = 1 : numel(uid_space)
+                if uid_space(i) == 0
+                    sta_id = i;
+                    return;
+                end
+            end
+            return;
+        end
+        function sta_id = get_sta_id_from_mac(obj, mac_addr)  
+            num = obj.sta_num;
+            for i = 1 : num
+                if obj.stas_info(i).mac_addr == mac_addr
+                    sta_id = obj.stas_info(i).sta_id;
+                    return;
+                end
+            end
+            sta_id = -1;
+            return;
+        end
+        function index = get_index(obj, val)  %根据uid找到对应的数组下标
+            num = obj.sta_num;
+            for i = 1 : num
+                if(obj.stas_info(i).sta_id == val)
+                    index = i;
+                    return;
+                end
+            end
+            index = -1;
+            return;
+        end 
+        
+    end
+end
